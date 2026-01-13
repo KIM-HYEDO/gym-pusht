@@ -18,7 +18,7 @@ from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 
 
-class PushTImageRealtimeRunner(Node):
+class PushTImageRunner(Node):
     def __init__(
         self,
         render_size: int = 96,
@@ -32,11 +32,10 @@ class PushTImageRealtimeRunner(Node):
         max_steps: int = 300,
         max_episodes: int = 10,
     ):
-        super().__init__("pusht_image_realtime_runner")
+        super().__init__("pusht_image_runner")
 
         self.render_size = render_size
         self.fps = float(fps)
-        self.period = 1.0 / self.fps
 
         self.action_topic = action_topic
         self.state_topic = state_topic
@@ -51,24 +50,20 @@ class PushTImageRealtimeRunner(Node):
 
         # Env
         self.seed = 100000
-        print(f"Initializing environment with seed {self.seed}")
         PushTImageEnv.metadata["video.frames_per_second"] = int(fps)
         self.env = PushTImageEnv(render_size=render_size, perturb_level=self.perturb_level)
-        self.env.seed(self.seed)
-        self.obs = self.env.reset()
-
-        if self.enable_human_render:
-            self.env._render_frame("human")
 
         self.bridge = CvBridge()
 
         self._act_lock = threading.Lock()
+        self._act_event = threading.Event()
         self.latest_ros_action = None
 
-        self.recording = False
-        self.video_writer = None
+        # Recording 
         self.record_dir = "recordings"
         os.makedirs(self.record_dir, exist_ok=True)
+        self.recording = False
+        self.video_writer = None
 
         qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1, reliability=ReliabilityPolicy.RELIABLE)
         self.sub_action = self.create_subscription(Float32MultiArray, self.action_topic, self._command_callback, qos_profile=qos)
@@ -77,28 +72,31 @@ class PushTImageRealtimeRunner(Node):
         self.init_pub = self.create_publisher(Bool, self.init_topic, qos_profile=qos)
 
         self.get_logger().info(
-            f"Started PushTImageRealtimeRunner fixed-rate loop (fps={fps}) "
-            f"action={action_topic}, state={state_topic}, image={image_topic}, init={init_topic}"
+            f"Started PushTImageRunner (action-driven step). "
+            f"fps={fps}, action={action_topic}, state={state_topic}, image={image_topic}"
         )
 
-    # ---------------- ROS callbacks ----------------
+    # -------- action callback (executor thread) --------
     def _command_callback(self, msg: Float32MultiArray):
         if len(msg.data) < 2:
             return
         try:
-            action_array = np.array(msg.data[:2], dtype=np.float32)
-            if np.any(np.isnan(action_array)):
+            a = np.array(msg.data[:2], dtype=np.float32)
+            if np.any(~np.isfinite(a)):
                 return
             with self._act_lock:
-                self.latest_ros_action = np.clip(action_array, 0, self.env.window_size)
+                self.latest_ros_action = np.clip(a, 0, self.env.window_size)
+                self._act_event.set()
         except Exception:
             pass
 
-    def _select_action(self):
+    def _select_action(self, obs):
         with self._act_lock:
-            return self.latest_ros_action.copy() if self.latest_ros_action is not None else self.obs["agent_pos"]
+            a = self.latest_ros_action.copy() if self.latest_ros_action is not None else None
+            self.latest_ros_action = None
+            self._act_event.clear()
+        return a if a is not None else obs["agent_pos"]
 
-    # ---------------- publish helpers ----------------
     def _publish_state(self, obs):
         msg = Float32MultiArray()
         msg.data = [float(obs["agent_pos"][0]), float(obs["agent_pos"][1])]
@@ -113,6 +111,18 @@ class PushTImageRealtimeRunner(Node):
     def _publish_init(self):
         self.init_pub.publish(Bool(data=True))
 
+    def _step_env(self, action):
+        out = self.env.step(action)
+        if len(out) == 4:
+            obs, reward, done, info = out
+        elif len(out) == 5:
+            obs, reward, terminated, truncated, info = out
+            done = bool(terminated or truncated)
+        else:
+            raise RuntimeError(f"Unexpected step() return length: {len(out)}")
+        return obs, reward, done, info
+
+    # -------- recording (streaming) --------
     def start_recording(self, filename=None):
         if self.recording:
             return
@@ -123,6 +133,10 @@ class PushTImageRealtimeRunner(Node):
         )
         self.recording = True
 
+    def _record_frame(self):
+        if self.recording and self.video_writer is not None:
+            self.video_writer.write(self.env._render_frame("rgb_array")[..., ::-1])
+
     def stop_recording(self):
         if not self.recording:
             return
@@ -131,58 +145,55 @@ class PushTImageRealtimeRunner(Node):
         self.video_writer = None
         self.recording = False
 
-    def _record_frame_if_needed(self):
-        if self.recording and self.video_writer is not None:
-            self.video_writer.write(self.env._render_frame("rgb_array")[..., ::-1])
+    def close(self):
+        self.stop_recording()
+        try:
+            self.env.close()
+        except Exception:
+            pass
 
-    def loop(self):
-        next_t = time.perf_counter()
-        step = 0
-
-        self._publish_init()
-        self.start_recording()
-
+    # -------- main episode runner (main thread) --------
+    def run(self, action_timeout=5.0):
         all_max_rewards = []
-        max_reward = 0.0
         pbar = tqdm.tqdm(range(self.max_episodes), desc="Episodes")
 
-        while rclpy.ok():
-            dt = next_t - time.perf_counter()
-            if dt > 0:
-                time.sleep(dt)
-            next_t += self.period
+        for episode in pbar:
+            self._publish_init()
+            self.env.seed(self.seed)
+            print(f"Resetting environment with seed {self.seed}")
+            obs = self.env.reset()
 
-            action = self._select_action()
-            self.obs, reward, done, info = self.env.step(action)
-            step += 1
-            max_reward = max(max_reward, reward)
-            pbar.set_postfix({"reward": f"{reward:.4f}", "max": f"{max_reward:.4f}", "step": f"{step}/{self.max_steps}"})
-            self._publish_state(self.obs)
-            self._publish_image(self.obs)
-            
             if self.enable_human_render:
                 self.env._render_frame("human")
-            self._record_frame_if_needed()
+            self._publish_state(obs)
+            self._publish_image(obs)
 
-            if done or step >= self.max_steps:
-                self._record_frame_if_needed()
-                self.stop_recording()
-                self.episode_count += 1
-                all_max_rewards.append(max_reward)
-                max_reward = step = 0
-                pbar.update(1)
-                if self.episode_count >= self.max_episodes:
-                    break
-                self.seed += 1
-                self.env.seed(self.seed)
-                self.start_recording()
-                print(f"Resetting environment with seed {self.seed}")
-                self.obs = self.env.reset()
-                with self._act_lock:
-                    self.latest_ros_action = None
-                self._publish_init()
+            self._act_event.clear()
+            with self._act_lock:
+                self.latest_ros_action = None
+
+            self.start_recording()
+            max_reward = 0.0
+            done = False
+            step = 0
+
+            while not done and step < self.max_steps:
+                self._act_event.wait(timeout=action_timeout)
+                action = self._select_action(obs)
+                obs, reward, done, info = self._step_env(action)
+                step += 1
+                max_reward = max(max_reward, float(reward))
+
+                self._publish_state(obs)
+                self._publish_image(obs)
                 if self.enable_human_render:
                     self.env._render_frame("human")
+                self._record_frame()
+                pbar.set_postfix({"reward": f"{reward:.4f}", "max": f"{max_reward:.4f}", "step": f"{step}/{self.max_steps}"})
+
+            all_max_rewards.append(max_reward)
+            self.stop_recording()
+            self.seed += 1
 
         if all_max_rewards:
             mean_reward = np.mean(all_max_rewards)
@@ -195,33 +206,27 @@ class PushTImageRealtimeRunner(Node):
                 f"Individual max_rewards: {[f'{r:.4f}' for r in all_max_rewards]}",
                 f"Policy: flow matching",
                 f"perturb: {self.perturb_level}",
-                f"mode: realtime_openloop",
+                f"mode: non_realtime_openloop",
                 "="*50
             ])
             print(f"\n{stats}")
             with open(os.path.join(self.record_dir, "result.txt"), 'w') as f:
                 f.write(stats + "\n")
 
-    def close(self):
-        self.stop_recording()
-        try:
-            self.env.close()
-        except Exception:
-            pass
-
 
 def main(args=None):
     rclpy.init(args=args)
-    node = PushTImageRealtimeRunner()
+    node = PushTImageRunner()
 
     executor = MultiThreadedExecutor(num_threads=2)
     executor.add_node(node)
-
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
     spin_thread.start()
 
     try:
-        node.loop()
+        node.run(action_timeout=5.0)
+    except KeyboardInterrupt:
+        pass
     finally:
         node.close()
         executor.shutdown()
